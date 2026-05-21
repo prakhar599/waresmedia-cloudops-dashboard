@@ -211,30 +211,31 @@
 <script>
 // ─── Config ───────────────────────────────────────────────
 let config = {
-  n8nUrl: localStorage.getItem('n8n_url') || '',
-  blobUrl: localStorage.getItem('blob_url') || '',
+  n8nUrl:   localStorage.getItem('n8n_url')   || '',
+  blobUrl:  localStorage.getItem('blob_url')  || '',
   sasToken: localStorage.getItem('sas_token') || '',
   slackUrl: localStorage.getItem('slack_url') || ''
 };
 
 function saveConfig() {
-  config.n8nUrl = document.getElementById('cfg-n8n').value.trim();
-  config.blobUrl = document.getElementById('cfg-blob').value.trim();
+  config.n8nUrl   = document.getElementById('cfg-n8n').value.trim();
+  config.blobUrl  = document.getElementById('cfg-blob').value.trim();
   config.sasToken = document.getElementById('cfg-sas').value.trim();
   config.slackUrl = document.getElementById('cfg-slack').value.trim();
-  localStorage.setItem('n8n_url', config.n8nUrl);
-  localStorage.setItem('blob_url', config.blobUrl);
+  localStorage.setItem('n8n_url',   config.n8nUrl);
+  localStorage.setItem('blob_url',  config.blobUrl);
   localStorage.setItem('sas_token', config.sasToken);
   localStorage.setItem('slack_url', config.slackUrl);
   closeConfig();
-  showToast('✅ Config saved — backend connected');
+  showToast('✅ Config saved — connecting to backend...');
+  startPolling();
   render();
 }
 
 function openConfig() {
-  document.getElementById('cfg-n8n').value = config.n8nUrl;
-  document.getElementById('cfg-blob').value = config.blobUrl;
-  document.getElementById('cfg-sas').value = config.sasToken;
+  document.getElementById('cfg-n8n').value   = config.n8nUrl;
+  document.getElementById('cfg-blob').value  = config.blobUrl;
+  document.getElementById('cfg-sas').value   = config.sasToken;
   document.getElementById('cfg-slack').value = config.slackUrl;
   document.getElementById('config-overlay').classList.add('open');
 }
@@ -245,115 +246,279 @@ function showToast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 3000);
+  setTimeout(() => t.classList.remove('show'), 3500);
 }
 
-// ─── Mock data (shown when no blob URL set) ───────────────
+// ─── Live state (populated from Blob) ────────────────────
+let liveData = {
+  logs: [],          // array of parsed blob log entries
+  approvals: [],     // array of pending approval entries
+  cleanupItems: [],  // latest cleanup scan resources
+  lastFetch: null,
+  fetchError: null
+};
+
+// ─── Fallback mock data ───────────────────────────────────
 const mockLogs = [
   { time: '08:03', dot: 'var(--teal-mid)', title: '⚡ CPU alert on ad-srv-07 (94%)', sub: 'OOM in bidder-service. Auto-restarted. CPU → 38%.', tag: 'auto-resolved', tagClass: 'tag-success' },
   { time: '07:21', dot: 'var(--blue-mid)', title: '📋 IaC: JIRA-482 — New PostgreSQL DB', sub: 'Terraform generated. Awaiting approval.', tag: 'pending approval', tagClass: 'tag-pending' },
   { time: '02:01', dot: 'var(--amber-mid)', title: '🧹 Nightly cleanup: 9 resources found', sub: '$340/mo savings. Auto-deletion in 21h.', tag: 'pending deletion', tagClass: 'tag-pending' },
-  { time: 'yest', dot: 'var(--teal-mid)', title: '⚡ CPU alert on ad-srv-03 (91%)', sub: 'Auto-restarted. No human intervention needed.', tag: 'auto-resolved', tagClass: 'tag-success' },
-  { time: 'yest', dot: 'var(--blue-mid)', title: '📋 IaC: JIRA-479 — S3 policy update', sub: 'Applied after Prakhar approved.', tag: 'applied', tagClass: 'tag-success' }
+  { time: 'yest',  dot: 'var(--teal-mid)', title: '⚡ CPU alert on ad-srv-03 (91%)', sub: 'Auto-restarted. No human intervention needed.', tag: 'auto-resolved', tagClass: 'tag-success' },
+  { time: 'yest',  dot: 'var(--blue-mid)', title: '📋 IaC: JIRA-479 — S3 policy update', sub: 'Applied after Prakhar approved.', tag: 'applied', tagClass: 'tag-success' }
 ];
-
 const mockApprovals = [
-  {
-    id: 'approval-JIRA-482',
-    ticketId: 'JIRA-482',
-    ticketTitle: 'New PostgreSQL DB for ad-analytics',
-    resourceType: 'postgresql',
-    requestedBy: 'prakhar',
-    status: 'pending',
-    planOutput: `Plan: 2 to add, 0 to change, 0 to destroy.\n  + azurerm_postgresql_flexible_server.main\n  + azurerm_postgresql_flexible_server_database.main`,
-    terraform: `resource "azurerm_postgresql_flexible_server" "main" {\n  name     = "waresmedia-psql-jira-482"\n  location = "Central India"\n  sku_name = "B_Standard_B1ms"\n  version  = "14"\n  storage_mb = 32768\n}`
-  },
-  {
-    id: 'approval-JIRA-479',
-    ticketId: 'JIRA-479',
-    ticketTitle: 'S3 bucket policy update — ad-creatives',
-    resourceType: 'storage',
-    requestedBy: 'prakhar',
-    status: 'pending',
-    planOutput: `Plan: 0 to add, 1 to change, 0 to destroy.\n  ~ azurerm_storage_account.ad_creatives (policy update)`,
-    terraform: `resource "azurerm_storage_account" "ad_creatives" {\n  name = "waresmediaadcreatives"\n  # policy updated to restrict public access\n}`
-  }
+  { id: 'approval-JIRA-482', ticketId: 'JIRA-482', ticketTitle: 'New PostgreSQL DB for ad-analytics', resourceType: 'postgresql', requestedBy: 'prakhar', status: 'pending',
+    planOutput: 'Plan: 2 to add, 0 to change, 0 to destroy.\n  + azurerm_postgresql_flexible_server.main\n  + azurerm_postgresql_flexible_server_database.main',
+    terraform: 'resource "azurerm_postgresql_flexible_server" "main" {\n  name     = "waresmedia-psql-jira-482"\n  location = "Central India"\n  sku_name = "B_Standard_B1ms"\n  version  = "14"\n  storage_mb = 32768\n}' },
+  { id: 'approval-JIRA-479', ticketId: 'JIRA-479', ticketTitle: 'S3 bucket policy update — ad-creatives', resourceType: 'storage', requestedBy: 'prakhar', status: 'pending',
+    planOutput: 'Plan: 0 to add, 1 to change, 0 to destroy.\n  ~ azurerm_storage_account.ad_creatives (policy update)',
+    terraform: 'resource "azurerm_storage_account" "ad_creatives" {\n  name = "waresmediaadcreatives"\n  # policy updated to restrict public access\n}' }
 ];
 
-// Track locally approved items in this session
-const approved = new Set();
+const approved = new Set(); // locally approved this session
 
-// ─── Blob fetch ───────────────────────────────────────────
-async function fetchBlob(filename) {
-  if (!config.blobUrl || !config.sasToken) return null;
+// ─── Blob helpers ─────────────────────────────────────────
+function blobBase() {
+  return config.blobUrl.replace(/\/$/, '');
+}
+
+function getSas() {
+  if (!config.sasToken) return '';
+  return config.sasToken.startsWith('?')
+    ? config.sasToken
+    : `?${config.sasToken}`;
+}
+
+async function fetchBlobFile(filename) {
   try {
-    const url = `${config.blobUrl}/${filename}${config.sasToken}`;
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    return await res.json();
-  } catch { return null; }
+    const url = `${blobBase()}/${filename}${getSas()}`;
+
+    const res = await fetch(url, { cache: 'no-store' });
+
+    if (!res.ok) {
+      console.error("Blob fetch failed:", filename, await res.text());
+      return null;
+    }
+
+    const text = await res.text();
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      console.warn("Non-JSON blob:", filename, text);
+      return { raw: text };
+    }
+  } catch (e) {
+    console.error("Blob file error:", filename, e);
+    return null;
+  }
 }
 
 async function fetchBlobList() {
-  if (!config.blobUrl || !config.sasToken) return [];
   try {
-    const url = `${config.blobUrl}${config.sasToken}&restype=container&comp=list`;
-    const res = await fetch(url);
+    const base = blobBase();
+
+    const sas = config.sasToken
+      ? (config.sasToken.startsWith('?') ? config.sasToken : `?${config.sasToken}`)
+      : '';
+
+    const url = `${base}?restype=container&comp=list${sas ? '&' + sas.replace('?', '') : ''}`;
+
+    const res = await fetch(url, { cache: 'no-store' });
+
+    if (!res.ok) {
+      console.error("Blob list failed:", await res.text());
+      return [];
+    }
+
     const text = await res.text();
-    const names = [...text.matchAll(/<Name>([^<]+)<\/Name>/g)].map(m => m[1]);
+
+    const names = [...text.matchAll(/<Name>([^<]+)<\/Name>/g)]
+      .map(m => m[1]);
+
     return names;
-  } catch { return []; }
+
+  } catch (e) {
+    console.error("Blob list error:", e);
+    return [];
+  }
 }
+// ─── Main data fetch — pulls ALL blobs and builds live state
+async function fetchAllBlobData() {
+  if (!config.blobUrl || !config.sasToken) return false;
+
+  try {
+    const names = await fetchBlobList();
+    if (!names.length) return false;
+
+    const fetchedLogs = [];
+    const fetchedApprovals = [];
+    let fetchedCleanup = null;
+
+    // Fetch all blobs in parallel
+    const results = await Promise.all(names.map(async name => ({ name, data: await fetchBlobFile(name) })));
+
+    for (const { name, data } of results) {
+      if (!data) continue;
+
+      if (name.startsWith('cpu-triage-') || (data.agentId === 'cpu-triage')) {
+        fetchedLogs.push(blobToCPULog(data));
+      }
+      else if (name.startsWith('approval-') || (data.agentId === 'iac-gen')) {
+        if (data.status === 'pending' && !approved.has(data.id)) {
+          fetchedApprovals.push(data);
+        }
+      }
+      else if (name.startsWith('cleanup-') || (data.agentId === 'nightly-cleanup')) {
+        // Keep the most recent cleanup report
+        if (!fetchedCleanup || data.timestamp > fetchedCleanup.timestamp) {
+          fetchedCleanup = data;
+        }
+        fetchedLogs.push(blobToCleanupLog(data));
+      }
+    console.log("📦 Blob files found:", names);
+    console.log("📊 Parsed logs:", fetchedLogs.length);
+    console.log("🧾 Approvals:", fetchedApprovals.length);
+  }
+
+    // Sort logs newest first
+    fetchedLogs.sort((a, b) => (b._ts || 0) - (a._ts || 0));
+
+    liveData.logs = fetchedLogs.slice(0, 20);
+    liveData.approvals = fetchedApprovals;
+    liveData.cleanupItems = fetchedCleanup?.unusedResources || liveData.cleanupItems;
+    liveData.lastFetch = new Date();
+    liveData.fetchError = null;
+    return true;
+  } catch(e) {
+    liveData.fetchError = e.message;
+    return false;
+  }
+}
+
+function blobToCPULog(d) {
+  const isFixed = d.action === 'restarted';
+  return {
+    _ts: new Date(d.timestamp).getTime(),
+    time: fmtTime(d.timestamp),
+    dot: isFixed ? 'var(--teal-mid)' : 'var(--amber-mid)',
+    title: `⚡ CPU alert on ${d.server || d.serverName} (${d.cpuPercent}%)`,
+    sub: isFixed
+      ? `Auto-restarted. CPU → ${d.newCpuPercent || '~35'}%.`
+      : `Escalated — manual action required.`,
+    tag: isFixed ? 'auto-resolved' : 'escalated',
+    tagClass: isFixed ? 'tag-success' : 'tag-pending'
+  };
+}
+
+function blobToCleanupLog(d) {
+  return {
+    _ts: new Date(d.timestamp).getTime(),
+    time: fmtTime(d.timestamp),
+    dot: 'var(--amber-mid)',
+    title: `🧹 Nightly cleanup: ${d.totalCount} resources found`,
+    sub: `$${d.totalMonthlyCostUSD}/mo savings potential. Auto-deletion scheduled.`,
+    tag: 'pending deletion',
+    tagClass: 'tag-pending'
+  };
+}
+
+function fmtTime(ts) {
+  if (!ts) return '--';
+  const d = new Date(ts);
+  const now = new Date();
+  const diffH = (now - d) / 3600000;
+  if (diffH < 24) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return 'yest';
+}
+
+// ─── Polling ──────────────────────────────────────────────
+let pollInterval = null;
+
+function startPolling() {
+  if (pollInterval) clearInterval(pollInterval);
+  if (!config.blobUrl || !config.sasToken) return;
+  
+  // Fetch immediately, then every 8 seconds
+  fetchAllBlobData().then(() => render());
+  
+  pollInterval = setInterval(async () => {
+    const updated = await fetchAllBlobData();
+    
+    // ✅ ADDED: Force UI refresh visibility & logging
+    console.log("🔄 Poll tick, updated:", updated, new Date().toISOString());
+    render(); 
+    
+  }, 8000);
+}
+
 
 // ─── n8n trigger ─────────────────────────────────────────
 async function triggerAgent(agentPath, payload) {
-  if (!config.n8nUrl) {
-    showToast('⚠️ Set n8n URL in Settings first');
-    return false;
-  }
+  if (!config.n8nUrl) { showToast('⚠️ Set n8n URL in Settings first'); return false; }
   try {
-    const url = `${config.n8nUrl}/webhook/${agentPath}`;
-    const res = await fetch(url, {
+    const res = await fetch(`${config.n8nUrl}/webhook/${agentPath}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
     return res.ok;
   } catch {
-    showToast('❌ Could not reach n8n — check URL and port');
+    showToast('❌ Could not reach n8n — check URL and that port 5678 is open');
     return false;
   }
 }
 
-// ─── Pages ────────────────────────────────────────────────
+// ─── Active logs: live if connected, mock otherwise ───────
+function getActiveLogs(filterFn) {
+  const src = liveData.logs.length ? liveData.logs : mockLogs;
+  return filterFn ? src.filter(filterFn) : src;
+}
+function getActiveApprovals() {
+  return liveData.approvals.length
+    ? liveData.approvals.filter(a => !approved.has(a.id))
+    : mockApprovals.filter(a => !approved.has(a.id));
+}
+
+// ─── Page routing ─────────────────────────────────────────
 let currentPage = 'dashboard';
 
 function setPage(page) {
   currentPage = page;
   document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-  event && event.target && event.target.closest('.nav-item') && event.target.closest('.nav-item').classList.add('active');
+  if (event?.target?.closest('.nav-item')) event.target.closest('.nav-item').classList.add('active');
   render();
 }
 
 function render() {
   const main = document.getElementById('main-content');
-  if (currentPage === 'dashboard') main.innerHTML = renderDashboard();
-  else if (currentPage === 'cpu') main.innerHTML = renderCPUPage();
-  else if (currentPage === 'iac') main.innerHTML = renderIaCPage();
-  else if (currentPage === 'cleanup') main.innerHTML = renderCleanupPage();
-  else if (currentPage === 'trigger') main.innerHTML = renderTriggerPage();
-  bindEvents();
+  if      (currentPage === 'dashboard') main.innerHTML = renderDashboard();
+  else if (currentPage === 'cpu')       main.innerHTML = renderCPUPage();
+  else if (currentPage === 'iac')       main.innerHTML = renderIaCPage();
+  else if (currentPage === 'cleanup')   main.innerHTML = renderCleanupPage();
+  else if (currentPage === 'trigger')   main.innerHTML = renderTriggerPage();
 }
 
-// ─── Dashboard page ───────────────────────────────────────
+// ─── Dashboard ────────────────────────────────────────────
 function renderDashboard() {
-  const connected = !!(config.n8nUrl && config.blobUrl);
-  const pendingCount = mockApprovals.filter(a => !approved.has(a.id)).length;
+  const connected = !!(config.n8nUrl && config.blobUrl && config.sasToken);
+  const logs = getActiveLogs();
+  const pendingApprovals = getActiveApprovals();
+  const autoResolved = liveData.logs.filter(l => l.tag === 'auto-resolved').length;
+  const lastFetchStr = liveData.lastFetch
+    ? `Last synced ${liveData.lastFetch.toLocaleTimeString()}`
+    : connected ? 'Connecting...' : '';
+
   return `
   <div class="topbar">
     <div>
       <div class="page-title">Agent Dashboard</div>
-      <div class="page-sub"><span class="live-dot" style="display:inline-block;margin-right:6px;"></span>${connected ? 'Connected to n8n + Azure Blob' : 'Demo mode — <a href="#" onclick="openConfig();return false;" style="color:var(--teal-mid)">connect your backend</a>'}</div>
+      <div class="page-sub">
+        <span class="live-dot" style="display:inline-block;margin-right:6px;"></span>
+        ${connected
+          ? `Live · ${lastFetchStr}${liveData.fetchError ? ' · <span style="color:var(--red)">⚠ Blob error: ' + liveData.fetchError + '</span>' : ''}`
+          : 'Demo mode — <a href="#" onclick="openConfig();return false;" style="color:var(--teal-mid)">connect your backend</a>'}
+      </div>
     </div>
     <div class="topbar-right">
       <button class="btn" onclick="openConfig()">⚙️ Settings</button>
@@ -368,18 +533,22 @@ function renderDashboard() {
       <div class="metric-change up">↑ All healthy</div>
     </div>
     <div class="metric">
-      <div class="metric-label">Auto-resolved (24h)</div>
-      <div class="metric-val">14</div>
-      <div class="metric-change up">↑ 82% auto-fix rate</div>
+      <div class="metric-label">Auto-resolved (live)</div>
+      <div class="metric-val">${connected ? autoResolved || liveData.logs.length : 14}</div>
+      <div class="metric-change up">↑ from Blob logs</div>
     </div>
     <div class="metric">
       <div class="metric-label">Cost Saved / mo</div>
-      <div class="metric-val" style="color:var(--teal-mid)">$340</div>
+      <div class="metric-val" style="color:var(--teal-mid)">
+        ${liveData.cleanupItems.length
+          ? '$' + liveData.cleanupItems.reduce((s,r) => s + (r.monthlyCostUSD||0), 0).toFixed(0)
+          : '$340'}
+      </div>
       <div class="metric-change up">↑ Via cleanup agent</div>
     </div>
     <div class="metric">
       <div class="metric-label">Pending Approvals</div>
-      <div class="metric-val" style="color:var(--amber-mid)">${pendingCount}</div>
+      <div class="metric-val" style="color:var(--amber-mid)">${pendingApprovals.length}</div>
       <div class="metric-change warn">⚑ Needs review</div>
     </div>
   </div>
@@ -395,8 +564,8 @@ function renderDashboard() {
         </div>
         <div class="agent-meta">
           <div class="meta"><div class="meta-k">Trigger</div><div class="meta-v">Azure Monitor webhook</div></div>
-          <div class="meta"><div class="meta-k">Last run</div><div class="meta-v">8 min ago</div></div>
-          <div class="meta"><div class="meta-k">Auto-resolved</div><div class="meta-v">11 / 14</div></div>
+          <div class="meta"><div class="meta-k">Last run</div><div class="meta-v">${liveData.logs.find(l=>l.title.includes('CPU'))?fmtTime(liveData.logs.find(l=>l.title.includes('CPU'))._ts):'8 min ago'}</div></div>
+          <div class="meta"><div class="meta-k">Auto-resolved</div><div class="meta-v">${autoResolved || 11} / ${liveData.logs.length || 14}</div></div>
           <div class="meta"><div class="meta-k">n8n endpoint</div><div class="meta-v">/webhook/cpu-alert</div></div>
         </div>
       </div>
@@ -404,12 +573,12 @@ function renderDashboard() {
         <div class="agent-head">
           <div class="agent-icon" style="background:var(--blue-bg)">📋</div>
           <div class="agent-info"><div class="agent-name">IaC Generation Agent</div><div class="agent-desc">GitHub Issue / Jira ticket → Terraform → plan check → Blob → approval → apply</div></div>
-          <span class="status-badge badge-blue">awaiting approval</span>
+          <span class="status-badge badge-blue">${pendingApprovals.length ? 'awaiting approval' : 'idle'}</span>
         </div>
         <div class="agent-meta">
           <div class="meta"><div class="meta-k">Trigger</div><div class="meta-v">Webhook (GitHub/Jira)</div></div>
           <div class="meta"><div class="meta-k">Last run</div><div class="meta-v">42 min ago</div></div>
-          <div class="meta"><div class="meta-k">Pending PRs</div><div class="meta-v">${pendingCount}</div></div>
+          <div class="meta"><div class="meta-k">Pending</div><div class="meta-v">${pendingApprovals.length} approvals</div></div>
           <div class="meta"><div class="meta-k">n8n endpoint</div><div class="meta-v">/webhook/iac-request</div></div>
         </div>
       </div>
@@ -422,7 +591,7 @@ function renderDashboard() {
         <div class="agent-meta">
           <div class="meta"><div class="meta-k">Trigger</div><div class="meta-v">cron 0 2 * * *</div></div>
           <div class="meta"><div class="meta-k">Last run</div><div class="meta-v">last night</div></div>
-          <div class="meta"><div class="meta-k">Flagged</div><div class="meta-v">9 resources</div></div>
+          <div class="meta"><div class="meta-k">Flagged</div><div class="meta-v">${liveData.cleanupItems.length || 9} resources</div></div>
           <div class="meta"><div class="meta-k">n8n endpoint</div><div class="meta-v">cron (internal)</div></div>
         </div>
       </div>
@@ -431,9 +600,11 @@ function renderDashboard() {
 
   <div class="two-col">
     <div class="panel">
-      <div class="section-head"><div class="section-title">Recent Activity</div></div>
+      <div class="section-head">
+        <div class="section-title">Recent Activity ${connected ? '<span style="font-size:10px;color:var(--teal-mid);font-weight:400;text-transform:none;letter-spacing:0">● live</span>' : '(demo)'}</div>
+      </div>
       <div class="log-feed">
-        ${mockLogs.map(l => `
+        ${logs.slice(0,6).map(l => `
         <div class="log-item">
           <div class="log-time">${l.time}</div>
           <div class="log-dot" style="background:${l.dot}"></div>
@@ -442,12 +613,12 @@ function renderDashboard() {
             <div class="log-sub">${l.sub}</div>
             <span class="tag ${l.tagClass}">${l.tag}</span>
           </div>
-        </div>`).join('')}
+        </div>`).join('') || '<div class="empty">No events yet — trigger an agent to see live data</div>'}
       </div>
     </div>
     <div class="panel">
       <div class="section-head"><div class="section-title">Pending Approvals</div><button class="btn btn-sm btn-blue" onclick="setPage('iac')">View all</button></div>
-      ${mockApprovals.filter(a => !approved.has(a.id)).map(a => `
+      ${pendingApprovals.slice(0,3).map(a => `
       <div class="approval-item">
         <div class="approval-row">
           <div>
@@ -457,7 +628,7 @@ function renderDashboard() {
           </div>
         </div>
         <div class="approval-actions">
-          <button class="btn btn-sm btn-primary" onclick="approveIaC('${a.id}', '${a.ticketId}')">✓ Approve</button>
+          <button class="btn btn-sm btn-primary" onclick="approveIaC('${a.id}','${a.ticketId}')">✓ Approve</button>
           <button class="btn btn-sm btn-danger" onclick="rejectIaC('${a.id}')">✗ Reject</button>
         </div>
       </div>`).join('') || '<div class="empty">All clear — no pending approvals</div>'}
@@ -467,35 +638,34 @@ function renderDashboard() {
 
 // ─── CPU page ─────────────────────────────────────────────
 function renderCPUPage() {
+  const logs = getActiveLogs(l => l.title.includes('CPU'));
+  const autoCount = logs.filter(l => l.tag === 'auto-resolved').length;
   return `
   <div class="topbar">
     <div><div class="page-title">CPU Alert Triage Agent</div><div class="page-sub">Webhook → logs → diagnose → auto-restart → Slack</div></div>
     <button class="btn btn-primary" onclick="triggerCPU()">▶ Trigger Test Alert</button>
   </div>
   <div class="metrics" style="grid-template-columns:repeat(3,1fr)">
-    <div class="metric"><div class="metric-label">Alerts today</div><div class="metric-val">14</div></div>
-    <div class="metric"><div class="metric-label">Auto-resolved</div><div class="metric-val" style="color:var(--teal-mid)">11</div><div class="metric-change up">78% auto-fix rate</div></div>
-    <div class="metric"><div class="metric-label">Escalated</div><div class="metric-val" style="color:var(--amber-mid)">3</div><div class="metric-change warn">Needed human</div></div>
+    <div class="metric"><div class="metric-label">Alerts (live)</div><div class="metric-val">${logs.length || 14}</div></div>
+    <div class="metric"><div class="metric-label">Auto-resolved</div><div class="metric-val" style="color:var(--teal-mid)">${autoCount || 11}</div><div class="metric-change up">${logs.length ? Math.round(autoCount/logs.length*100) : 78}% auto-fix rate</div></div>
+    <div class="metric"><div class="metric-label">Escalated</div><div class="metric-val" style="color:var(--amber-mid)">${(logs.length - autoCount) || 3}</div><div class="metric-change warn">Needed human</div></div>
   </div>
   <div class="section">
     <div class="section-title" style="margin-bottom:12px">How the agent works</div>
     <div class="panel" style="font-size:13px;color:var(--text2);line-height:1.8">
       <ol style="padding-left:18px">
-        <li>Azure Monitor fires a webhook to <code style="background:var(--bg3);padding:1px 5px;border-radius:4px">${config.n8nUrl || 'http://YOUR_VM_IP:5678'}/webhook/cpu-alert</code></li>
-        <li>n8n workflow receives the payload (server name, CPU %, alert type)</li>
-        <li>Fetches Azure Log Analytics for the last 5 min of logs from that server</li>
-        <li>Analyses top processes — checks if it's an OOM or runaway process</li>
-        <li>If CPU &lt; 99% and cause is identifiable → auto-restarts the service via Azure Run Command</li>
-        <li>If unsafe → escalates to Slack with a flag</li>
-        <li>Posts a Slack summary either way, and writes an event log to Azure Blob</li>
-        <li>Dashboard reads the Blob log and shows the result here</li>
+        <li>Azure Monitor fires a webhook to <code style="background:var(--bg3);padding:1px 5px;border-radius:4px">${config.n8nUrl||'http://YOUR_VM_IP:5678'}/webhook/cpu-alert</code></li>
+        <li>n8n receives payload → fetches recent logs → checks top process</li>
+        <li>If OOM and CPU &lt; 99% → auto-restarts service via Azure Run Command</li>
+        <li>If unsafe → escalates to Slack with a ⚠ flag</li>
+        <li>Writes result JSON to Azure Blob → dashboard picks it up within 8 seconds</li>
       </ol>
     </div>
   </div>
   <div class="panel">
-    <div class="section-head"><div class="section-title">Recent executions</div></div>
+    <div class="section-head"><div class="section-title">Executions ${liveData.logs.length ? '(live from Blob)' : '(demo)'}</div></div>
     <div class="log-feed">
-      ${mockLogs.filter(l => l.title.includes('CPU')).map(l => `
+      ${logs.map(l => `
       <div class="log-item">
         <div class="log-time">${l.time}</div>
         <div class="log-dot" style="background:${l.dot}"></div>
@@ -504,37 +674,37 @@ function renderCPUPage() {
           <div class="log-sub">${l.sub}</div>
           <span class="tag ${l.tagClass}">${l.tag}</span>
         </div>
-      </div>`).join('')}
+      </div>`).join('') || '<div class="empty">No CPU alerts yet — click "Trigger Test Alert" above</div>'}
     </div>
   </div>`;
 }
 
 // ─── IaC page ─────────────────────────────────────────────
 function renderIaCPage() {
-  const pending = mockApprovals.filter(a => !approved.has(a.id));
+  const pending = getActiveApprovals();
   return `
   <div class="topbar">
     <div><div class="page-title">IaC Generation Agent</div><div class="page-sub">Ticket → Terraform → plan check → human approval → apply</div></div>
     <button class="btn btn-primary" onclick="triggerIaC()">▶ Simulate New Ticket</button>
   </div>
   <div class="section">
-    <div class="section-title" style="margin-bottom:12px">Pending Approvals (${pending.length})</div>
+    <div class="section-title" style="margin-bottom:12px">Pending Approvals (${pending.length}) ${liveData.approvals.length ? '<span style="font-size:11px;color:var(--teal-mid);font-weight:400">● live from Blob</span>' : ''}</div>
     ${pending.map(a => `
     <div class="panel" style="margin-bottom:12px">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
         <div>
-          <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:0.04em">${a.ticketId} · ${a.resourceType}</div>
-          <div style="font-size:15px;font-weight:600;margin-top:3px">${a.ticketTitle}</div>
-          <div style="font-size:12px;color:var(--text2);margin-top:2px">Requested by ${a.requestedBy}</div>
+          <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:0.04em">${a.ticketId||''} · ${a.resourceType||''}</div>
+          <div style="font-size:15px;font-weight:600;margin-top:3px">${a.ticketTitle||a.title||''}</div>
+          <div style="font-size:12px;color:var(--text2);margin-top:2px">Requested by ${a.requestedBy||'unknown'}</div>
         </div>
         <span class="status-badge badge-amber">pending</span>
       </div>
       <div style="font-size:12px;font-weight:500;color:var(--text2);margin-bottom:6px">Terraform plan:</div>
-      <div class="tf-code">${a.planOutput}</div>
+      <div class="tf-code">${(a.planOutput||'').replace(/</g,'&lt;')}</div>
       <div style="font-size:12px;font-weight:500;color:var(--text2);margin:10px 0 6px">Generated Terraform:</div>
-      <div class="tf-code">${a.terraform.replace(/resource/g,'<span class="tf-keyword">resource</span>').replace(/"[^"]+"/g, s => '<span class="tf-string">'+s+'</span>').replace(/#.*/g, s => '<span class="tf-comment">'+s+'</span>')}</div>
+      <div class="tf-code">${(a.terraform||'').replace(/resource/g,'<span class="tf-keyword">resource</span>').replace(/"[^"]+"/g,s=>'<span class="tf-string">'+s+'</span>').replace(/#.*/g,s=>'<span class="tf-comment">'+s+'</span>')}</div>
       <div class="approval-actions" style="margin-top:12px">
-        <button class="btn btn-primary" onclick="approveIaC('${a.id}','${a.ticketId}')">✓ Approve & Apply</button>
+        <button class="btn btn-primary" onclick="approveIaC('${a.id}','${a.ticketId||''}')">✓ Approve & Apply</button>
         <button class="btn btn-danger" onclick="rejectIaC('${a.id}')">✗ Reject</button>
       </div>
     </div>`).join('') || '<div class="panel"><div class="empty">No pending approvals 🎉</div></div>'}`;
@@ -542,30 +712,34 @@ function renderIaCPage() {
 
 // ─── Cleanup page ─────────────────────────────────────────
 function renderCleanupPage() {
-  const resources = [
-    { name: 'old-disk-01', type: 'Managed Disk', cost: 8.19, reason: 'Unattached 60+ days' },
-    { name: 'backup-disk-old', type: 'Managed Disk', cost: 16.38, reason: 'Unattached 90+ days' },
-    { name: 'test-disk-feb', type: 'Managed Disk', cost: 4.10, reason: 'Test disk, never used' },
-    { name: 'snap-2024-06', type: 'Snapshot', cost: 18.43, reason: 'Older than 90 days' },
-    { name: 'snap-2024-07', type: 'Snapshot', cost: 18.43, reason: 'Older than 90 days' },
-    { name: 'dev-snap-old', type: 'Snapshot', cost: 9.22, reason: 'Dev snapshot, stale' },
-    { name: 'unused-ip-01', type: 'Public IP', cost: 3.65, reason: 'Not associated' },
-    { name: 'unused-ip-02', type: 'Public IP', cost: 3.65, reason: 'Not associated' },
-    { name: 'devteststore2023', type: 'Storage Account', cost: 1.02, reason: 'No activity 6+ months' }
+  const resources = liveData.cleanupItems.length ? liveData.cleanupItems : [
+    { name: 'old-disk-01',      type: 'Managed Disk',    monthlyCostUSD: 8.19,  reason: 'Unattached 60+ days' },
+    { name: 'backup-disk-old',  type: 'Managed Disk',    monthlyCostUSD: 16.38, reason: 'Unattached 90+ days' },
+    { name: 'test-disk-feb',    type: 'Managed Disk',    monthlyCostUSD: 4.10,  reason: 'Test disk, never used' },
+    { name: 'snap-2024-06',     type: 'Snapshot',        monthlyCostUSD: 18.43, reason: 'Older than 90 days' },
+    { name: 'snap-2024-07',     type: 'Snapshot',        monthlyCostUSD: 18.43, reason: 'Older than 90 days' },
+    { name: 'dev-snap-old',     type: 'Snapshot',        monthlyCostUSD: 9.22,  reason: 'Dev snapshot, stale' },
+    { name: 'unused-ip-01',     type: 'Public IP',       monthlyCostUSD: 3.65,  reason: 'Not associated' },
+    { name: 'unused-ip-02',     type: 'Public IP',       monthlyCostUSD: 3.65,  reason: 'Not associated' },
+    { name: 'devteststore2023', type: 'Storage Account', monthlyCostUSD: 1.02,  reason: 'No activity 6+ months' }
   ];
-  const total = resources.reduce((s, r) => s + r.cost, 0).toFixed(2);
+  const total = resources.reduce((s,r) => s + (r.monthlyCostUSD||r.cost||0), 0).toFixed(2);
+  const isLive = !!liveData.cleanupItems.length;
   return `
   <div class="topbar">
     <div><div class="page-title">Nightly Cleanup Agent</div><div class="page-sub">Runs at 2am · scans unused Azure resources · reports · auto-deletes after 24h</div></div>
     <button class="btn btn-primary" onclick="triggerCleanup()">▶ Run Scan Now</button>
   </div>
   <div class="metrics" style="grid-template-columns:repeat(3,1fr)">
-    <div class="metric"><div class="metric-label">Resources flagged</div><div class="metric-val" style="color:var(--amber-mid)">9</div></div>
+    <div class="metric"><div class="metric-label">Resources flagged ${isLive?'(live)':''}</div><div class="metric-val" style="color:var(--amber-mid)">${resources.length}</div></div>
     <div class="metric"><div class="metric-label">Monthly waste</div><div class="metric-val" style="color:var(--red)">$${total}</div></div>
     <div class="metric"><div class="metric-label">Auto-deletion in</div><div class="metric-val">21h</div><div class="metric-change warn">Reply SKIP to cancel</div></div>
   </div>
   <div class="panel">
-    <div class="section-head"><div class="section-title">Flagged resources (last scan — 02:01)</div><button class="btn btn-sm btn-danger" onclick="showToast('SKIP sent — deletion cancelled for today')">Send SKIP</button></div>
+    <div class="section-head">
+      <div class="section-title">Flagged resources ${isLive ? '<span style="font-size:10px;color:var(--teal-mid);font-weight:400">● live from Blob</span>' : '(demo)'}</div>
+      <button class="btn btn-sm btn-danger" onclick="showToast('SKIP sent — deletion cancelled for today')">Send SKIP</button>
+    </div>
     <table style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="border-bottom:1px solid var(--border)">
         <th style="text-align:left;padding:8px 0;color:var(--text2);font-weight:500">Resource</th>
@@ -578,7 +752,7 @@ function renderCleanupPage() {
           <td style="padding:9px 0;font-family:var(--mono);font-size:12px">${r.name}</td>
           <td style="padding:9px 0"><span class="tag tag-pending" style="text-transform:none">${r.type}</span></td>
           <td style="padding:9px 0;color:var(--text2)">${r.reason}</td>
-          <td style="padding:9px 0;text-align:right;color:var(--red);font-weight:500">$${r.cost}</td>
+          <td style="padding:9px 0;text-align:right;color:var(--red);font-weight:500">$${r.monthlyCostUSD||r.cost}</td>
         </tr>`).join('')}
         <tr><td colspan="3" style="padding:10px 0;font-weight:600">Total</td><td style="padding:10px 0;text-align:right;font-weight:600;color:var(--red)">$${total}/mo</td></tr>
       </tbody>
@@ -590,7 +764,7 @@ function renderCleanupPage() {
 function renderTriggerPage() {
   return `
   <div class="topbar">
-    <div><div class="page-title">Trigger an Agent</div><div class="page-sub">Fire any agent manually — useful for demos and testing</div></div>
+    <div><div class="page-title">Trigger an Agent</div><div class="page-sub">Fire any agent manually — results appear on dashboard within 8 seconds</div></div>
   </div>
   <div class="two-col">
     <div class="panel">
@@ -613,25 +787,33 @@ function renderTriggerPage() {
   </div>
   <div class="panel" style="margin-top:16px">
     <div class="section-title" style="margin-bottom:14px">🧹 Manual Cleanup Scan</div>
-    <p style="font-size:13px;color:var(--text2);margin-bottom:14px">Normally runs at 2am via cron. Click to trigger a scan immediately for demo purposes.</p>
+    <p style="font-size:13px;color:var(--text2);margin-bottom:14px">Normally runs at 2am via cron. Click to trigger immediately for demo purposes.</p>
     <button class="btn btn-primary" onclick="triggerCleanup()">▶ Run Cleanup Scan Now</button>
+  </div>
+  <div class="panel" style="margin-top:16px;background:var(--bg3)">
+    <div class="section-title" style="margin-bottom:8px">💡 How live updates work</div>
+    <p style="font-size:13px;color:var(--text2);line-height:1.7">
+      When you trigger an agent, n8n runs the workflow and writes a JSON log file to Azure Blob Storage.
+      This dashboard polls Blob every <strong>8 seconds</strong> and re-renders with real data.
+      After firing any agent above, switch to the Dashboard tab — you'll see the new event appear automatically.
+    </p>
   </div>`;
 }
 
-// ─── Event handlers ───────────────────────────────────────
-function bindEvents() {}
-
+// ─── Actions ─────────────────────────────────────────────
 async function approveIaC(id, ticketId) {
   approved.add(id);
+  // Also mark it in liveData so it disappears immediately
+  liveData.approvals = liveData.approvals.filter(a => a.id !== id);
   showToast('✅ Approved — triggering Terraform apply...');
-  if (config.n8nUrl) {
-    await triggerAgent('approve-iac', { approvalId: id, ticketId, approvedBy: 'prakhar' });
-  }
+  if (config.n8nUrl) await triggerAgent('approve-iac', { approvalId: id, ticketId, approvedBy: 'prakhar' });
   setTimeout(() => { showToast('🚀 Terraform applied — DB is live'); render(); }, 2000);
+  render();
 }
 
 function rejectIaC(id) {
   approved.add(id);
+  liveData.approvals = liveData.approvals.filter(a => a.id !== id);
   showToast('✗ Rejected — ticket updated');
   render();
 }
@@ -639,22 +821,22 @@ function rejectIaC(id) {
 async function triggerCPU() {
   const server = document.getElementById('t-server')?.value || 'ad-srv-07';
   const cpu = parseInt(document.getElementById('t-cpu')?.value || '94');
-  showToast('⚡ Sending CPU alert to n8n...');
+  showToast('⚡ Sending alert to n8n... dashboard updates in ~8s');
   const ok = await triggerAgent('cpu-alert', { serverName: server, cpuPercent: cpu });
-  if (ok) showToast(`✅ Agent triggered — check Slack for results`);
+  if (ok) showToast('✅ n8n running — watch Dashboard tab for live result');
 }
 
 async function triggerIaC() {
   const ticketId = document.getElementById('t-ticket')?.value || 'JIRA-490';
-  const title = document.getElementById('t-title')?.value || 'New PostgreSQL DB';
-  const by = document.getElementById('t-by')?.value || 'prakhar';
-  showToast('📋 Sending IaC ticket to n8n...');
+  const title    = document.getElementById('t-title')?.value  || 'New PostgreSQL DB';
+  const by       = document.getElementById('t-by')?.value     || 'prakhar';
+  showToast('📋 Sending IaC ticket to n8n... dashboard updates in ~8s');
   const ok = await triggerAgent('iac-request', { ticketId, title, requestedBy: by });
   if (ok) showToast('✅ Terraform generating — check Approvals tab');
 }
 
 async function triggerCleanup() {
-  showToast('🧹 Triggering cleanup scan...');
+  showToast('🧹 Running cleanup scan... dashboard updates in ~8s');
   const ok = await triggerAgent('cleanup-now', {});
   if (ok) showToast('✅ Scan complete — check Cleanup page');
   else showToast('ℹ️ In production, cron triggers this at 2am');
@@ -662,7 +844,11 @@ async function triggerCleanup() {
 
 // ─── Boot ─────────────────────────────────────────────────
 render();
-if (!config.n8nUrl) setTimeout(openConfig, 800);
+if (config.blobUrl && config.sasToken) {
+  startPolling();
+} else {
+  setTimeout(openConfig, 600);
+}
 </script>
 </body>
 </html>
