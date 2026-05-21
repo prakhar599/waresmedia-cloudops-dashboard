@@ -819,13 +819,40 @@ function rejectIaC(id) {
 }
 
 async function triggerCPU() {
-  const server = document.getElementById('t-server')?.value || 'ad-srv-07';
-  const cpu = parseInt(document.getElementById('t-cpu')?.value || '94');
-  showToast('⚡ Sending alert to n8n... dashboard updates in ~8s');
-  const ok = await triggerAgent('cpu-alert', { serverName: server, cpuPercent: cpu });
-  if (ok) showToast('✅ n8n running — watch Dashboard tab for live result');
-}
+  try {
+    const server =
+      document.getElementById('t-server')?.value?.trim() || 'ad-srv-07';
 
+    const cpuRaw =
+      document.getElementById('t-cpu')?.value?.trim() || '94';
+
+    const cpu = Number(cpuRaw);
+
+    if (isNaN(cpu)) {
+      showToast('❌ Invalid CPU value');
+      return;
+    }
+
+    showToast('⚡ Sending alert to n8n...');
+
+    const ok = await triggerAgent('cpu-alert', {
+      serverName: server,
+      cpuPercent: cpu
+    });
+
+    if (!ok) {
+      showToast('❌ Failed to reach n8n — check URL / port / VM');
+      return;
+    }
+
+    showToast('✅ n8n running — watch dashboard in ~8s');
+
+  } catch (err) {
+    console.error(err);
+    showToast('❌ Unexpected error while triggering agent');
+  }
+}
+  
 async function triggerIaC() {
   const ticketId = document.getElementById('t-ticket')?.value || 'JIRA-490';
   const title    = document.getElementById('t-title')?.value  || 'New PostgreSQL DB';
